@@ -79,11 +79,9 @@ if uploaded_file is not None:
                         miktar_str = str(row.get('Miktar', '')).strip()
                         tutar_str = str(row.get('Mal Hizmet Tutarı', '')).strip()
                         
-                        # --- YENİ EKLENEN KISIM: MAL TANIMINI ÇEKME ---
-                        # Faturadaki Mal Tanımı sütun adını güvenli bir şekilde bulmaya çalışıyoruz
+                        # Mal Tanımını Çekme
                         mal_tanimi = str(row.get('Mal Hizmet', row.get('Cinsi', row.get('Ürün Kodu', '')))).replace('\n', ' ').strip()
                         
-                        # Sütun adı bunlardan farklıysa içinde geçen kelimelerden tespit et
                         if not mal_tanimi or mal_tanimi.lower() in ["nan", "none"]:
                             for col in df.columns:
                                 if "mal" in str(col).lower() or "hizmet" in str(col).lower() or "tanım" in str(col).lower() or "cins" in str(col).lower():
@@ -91,10 +89,8 @@ if uploaded_file is not None:
                                         mal_tanimi = str(row.get(col, '')).replace('\n', ' ').strip()
                                         break
                                         
-                        # Eğer hiçbir şekilde bulamadıysa varsayılan değer ata
                         if not mal_tanimi or mal_tanimi.lower() in ["nan", "none"]:
                             mal_tanimi = "Tanım Bulunamadı"
-                        # ----------------------------------------------
 
                         if not gtip or gtip.lower() in ["none", "nan", ""] or "toplam" in gtip.lower():
                             continue
@@ -128,8 +124,6 @@ if uploaded_file is not None:
                     if parsed_data:
                         df_parsed = pd.DataFrame(parsed_data)
                         
-                        # Aynı GTİP ve Menşeideki satırları grupla
-                        # 'Mal Tanımı' sütununu birleştiriyoruz (Örn: A Ürünü | B Ürünü)
                         df_grouped = df_parsed.groupby(['GTİP', 'Menşei', 'Birim'], as_index=False).agg({
                             'Toplam Miktar': 'sum', 
                             'Toplam Fiyat': 'sum',
@@ -143,13 +137,12 @@ if uploaded_file is not None:
                         
                         for index, row in df_grouped.iterrows():
                             tam_tanim = row['Mal Tanımı']
-                            # Başlıkta çok uzun durmaması için ilk 45 karakteri alıp sonuna ... koyuyoruz
                             kisa_tanim = tam_tanim[:45] + "..." if len(tam_tanim) > 45 else tam_tanim
                             
-                            # Kutu Başlığı (Expander Header)
                             baslik_metni = f"📦 KALEM {index + 1}  |  GTİP: {row['GTİP']}  |  {kisa_tanim}"
                             
-                            with st.expander(baslik_metni, expanded=True):
+                            # EKRANA KAPALI GELMESİ İÇİN expanded=False YAPILDI
+                            with st.expander(baslik_metni, expanded=False):
                                 st.markdown(f"**🏷️ Tam Mal Tanımı:** {tam_tanim}")
                                 st.markdown(f"**🔹 GTİP Kodu:** {row['GTİP']}")
                                 st.markdown(f"**🌍 Menşei:** {row['Menşei']}")
@@ -159,7 +152,6 @@ if uploaded_file is not None:
                         
                         st.markdown("---")
                         
-                        # İndirme Butonu (Detaylı Excel Çıktısı)
                         df_grouped['Brüt/Net Kilo'] = kilo_bilgisi
                         csv = df_grouped.to_csv(index=False).encode('utf-8-sig')
                         st.download_button(
