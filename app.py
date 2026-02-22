@@ -26,11 +26,10 @@ if uploaded_file is not None:
             # 1. Genel Bilgileri Çekme (Unvan, VKN, Fatura No vb.)
             lines = [line.strip() for line in text.split('\n') if line.strip()]
             
-            # Unvanı bulmak için içinde Şirket/Ticaret geçen ilk satırı arıyoruz
             unvan_adaylari = [line for line in lines[:15] if "ŞİRKETİ" in line.upper() or "A.Ş" in line.upper() or "LTD" in line.upper() or "TİC" in line.upper()]
             unvan = unvan_adaylari[0] if unvan_adaylari else (lines[0] if lines else "Bulunamadı")
 
-            vkn_match = re.search(r'Vergi Numaras[ıi]\s*[:\-]?\s*(\d{10,11})', text, re.IGNORECASE)
+            vkn_match = re.search(r'Vergi Numaras[ıiIİ]\s*[:\-]?\s*(\d{10,11})', text)
             vkn = vkn_match.group(1) if vkn_match else "Bulunamadı"
 
             fatura_no_match = re.search(r'Fatura No\s*([A-Z0-9]+)', text)
@@ -52,7 +51,6 @@ if uploaded_file is not None:
             st.markdown(f"**🏷️ Vergi Numarası:** {vkn}")
             st.markdown("---")
             
-            # Fatura Özet Metrikleri
             c1, c2, c3 = st.columns(3)
             c1.metric("Fatura No", f_no)
             c2.metric("Fatura Tarihi", f_tarih)
@@ -80,6 +78,23 @@ if uploaded_file is not None:
                         mensei = str(row.get('Menşe Ülke', '')).replace('\n', ' ').strip()
                         miktar_str = str(row.get('Miktar', '')).strip()
                         tutar_str = str(row.get('Mal Hizmet Tutarı', '')).strip()
+                        
+                        # --- YENİ EKLENEN KISIM: MAL TANIMINI ÇEKME ---
+                        # Faturadaki Mal Tanımı sütun adını güvenli bir şekilde bulmaya çalışıyoruz
+                        mal_tanimi = str(row.get('Mal Hizmet', row.get('Cinsi', row.get('Ürün Kodu', '')))).replace('\n', ' ').strip()
+                        
+                        # Sütun adı bunlardan farklıysa içinde geçen kelimelerden tespit et
+                        if not mal_tanimi or mal_tanimi.lower() in ["nan", "none"]:
+                            for col in df.columns:
+                                if "mal" in str(col).lower() or "hizmet" in str(col).lower() or "tanım" in str(col).lower() or "cins" in str(col).lower():
+                                    if "tutar" not in str(col).lower() and "fiyat" not in str(col).lower():
+                                        mal_tanimi = str(row.get(col, '')).replace('\n', ' ').strip()
+                                        break
+                                        
+                        # Eğer hiçbir şekilde bulamadıysa varsayılan değer ata
+                        if not mal_tanimi or mal_tanimi.lower() in ["nan", "none"]:
+                            mal_tanimi = "Tanım Bulunamadı"
+                        # ----------------------------------------------
 
                         if not gtip or gtip.lower() in ["none", "nan", ""] or "toplam" in gtip.lower():
                             continue
@@ -105,15 +120,20 @@ if uploaded_file is not None:
                             'GTİP': gtip,
                             'Menşei': mensei,
                             'Birim': birim_val,
+                            'Mal Tanımı': mal_tanimi,
                             'Toplam Miktar': miktar_val,
                             'Toplam Fiyat': tutar_val
                         })
 
                     if parsed_data:
                         df_parsed = pd.DataFrame(parsed_data)
+                        
+                        # Aynı GTİP ve Menşeideki satırları grupla
+                        # 'Mal Tanımı' sütununu birleştiriyoruz (Örn: A Ürünü | B Ürünü)
                         df_grouped = df_parsed.groupby(['GTİP', 'Menşei', 'Birim'], as_index=False).agg({
                             'Toplam Miktar': 'sum', 
-                            'Toplam Fiyat': 'sum'
+                            'Toplam Fiyat': 'sum',
+                            'Mal Tanımı': lambda x: ' | '.join(pd.unique(x)) 
                         })
                         
                         df_grouped['Toplam Fiyat'] = df_grouped['Toplam Fiyat'].apply(lambda x: f"{x:,.2f} EUR".replace(',', 'X').replace('.', ',').replace('X', '.'))
@@ -121,22 +141,33 @@ if uploaded_file is not None:
                         # ---- ALT KISIM: AÇILIR KAPANIR LİSTE (POP-UP) GÖRÜNÜMÜ ----
                         st.subheader("📋 Gruplanmış Beyan Kalemleri")
                         
-                        # Her bir satırı numarayla kart şeklinde yazdırma
                         for index, row in df_grouped.iterrows():
-                            # st.expander ile tıklayınca açılan kutucuklar (Pop-up hissi)
-                            with st.expander(f"📦 KALEM {index + 1}  |  GTİP: {row['GTİP']}  |  Menşei: {row['Menşei']}", expanded=True):
+                            tam_tanim = row['Mal Tanımı']
+                            # Başlıkta çok uzun durmaması için ilk 45 karakteri alıp sonuna ... koyuyoruz
+                            kisa_tanim = tam_tanim[:45] + "..." if len(tam_tanim) > 45 else tam_tanim
+                            
+                            # Kutu Başlığı (Expander Header)
+                            baslik_metni = f"📦 KALEM {index + 1}  |  GTİP: {row['GTİP']}  |  {kisa_tanim}"
+                            
+                            with st.expander(baslik_metni, expanded=True):
+                                st.markdown(f"**🏷️ Tam Mal Tanımı:** {tam_tanim}")
                                 st.markdown(f"**🔹 GTİP Kodu:** {row['GTİP']}")
                                 st.markdown(f"**🌍 Menşei:** {row['Menşei']}")
-                                # Miktarı küsuratsız yazmak için tam sayıya çevirme kontrolü
                                 miktar_gosterim = int(row['Toplam Miktar']) if row['Toplam Miktar'].is_integer() else row['Toplam Miktar']
-                                st.markdown(f"**⚖️ Miktar:** {miktar_gosterim} {row['Birim']}")
+                                st.markdown(f"**⚖️ Toplam Miktar:** {miktar_gosterim} {row['Birim']}")
                                 st.markdown(f"**💰 Toplam Fiyat:** {row['Toplam Fiyat']}")
                         
                         st.markdown("---")
-                        # İndirme Butonu (İsteğe bağlı Excel yedeği)
+                        
+                        # İndirme Butonu (Detaylı Excel Çıktısı)
                         df_grouped['Brüt/Net Kilo'] = kilo_bilgisi
                         csv = df_grouped.to_csv(index=False).encode('utf-8-sig')
-                        st.download_button("📥 Bu Verileri Excel (CSV) Olarak da İndir", data=csv, file_name='etgb_kalemler.csv', mime='text/csv')
+                        st.download_button(
+                            label="📥 Bu Verileri Excel (CSV) Olarak da İndir", 
+                            data=csv, 
+                            file_name='etgb_kalemler.csv', 
+                            mime='text/csv'
+                        )
                     else:
                         st.warning("Fatura kalemleri çıkarılamadı.")
                 else:
