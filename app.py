@@ -2,222 +2,231 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import re
+import pytesseract
+from PIL import Image
 
-# Sayfa genişliğini ayarlama
 st.set_page_config(page_title="ETGB Veri Analisti", page_icon="📦", layout="wide")
-
-# Sayfa başlığı
 st.title("📦 ETGB İhracat Beyannamesi Otomasyonu")
-st.markdown("E-Arşiv Faturanızı (PDF) yükleyin. Sistem sol tarafa özet tabloyu, sağ tarafa ise kopyalanabilir kalemleri çıkaracaktır.")
+st.markdown("PDF, JPG, PNG veya Ekran Görüntülerini **çoklu olarak** seçip yükleyebilirsiniz. Sistem tüm dosyaları birleştirip sol tarafa özet, sağ tarafa kopyalanabilir kalemler çıkarır.")
 
-uploaded_file = st.file_uploader("PDF Formatında Fatura Yükleyiniz", type="pdf")
+# Çoklu Dosya Yükleyici (Resimler ve PDF'ler)
+uploaded_files = st.file_uploader("PDF veya Ekran Görüntüsü Yükleyiniz", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
 
-if uploaded_file is not None:
-    with st.spinner('Belge analiz ediliyor... Lütfen bekleyin.'):
+if uploaded_files:
+    with st.spinner('Tüm belgeler yapay zeka ile analiz ediliyor... Lütfen bekleyin.'):
         try:
-            text = ""
-            all_tables = []
+            tum_kalemler = []
+            genel_unvanlar = set()
+            genel_vknler = set()
+            genel_fatura_nolar = set()
+            genel_tarihler = set()
+            kilo_notlari = []
             
-            # PDF'i oku
-            with pdfplumber.open(uploaded_file) as pdf:
-                for page in pdf.pages:
-                    text += page.extract_text() + "\n"
-                    tables = page.extract_tables()
-                    for table in tables:
-                        all_tables.extend(table)
+            toplam_navlun = 0.0
+            toplam_sigorta = 0.0
+            doviz_cinsi = "EUR"
 
-            # --- 1. GENEL BİLGİLERİ VE MASRAFLARI ÇEKME ---
-            lines = [line.strip() for line in text.split('\n') if line.strip()]
-            
-            # Unvan
-            unvan_adaylari = [line for line in lines[:15] if "ŞİRKETİ" in line.upper() or "A.Ş" in line.upper() or "LTD" in line.upper() or "TİC" in line.upper()]
-            unvan = unvan_adaylari[0] if unvan_adaylari else (lines[0] if lines else "Bulunamadı")
-
-            # VKN
-            vkn_match = re.search(r'Vergi Numaras[ıiIİ]\s*[:\-]?\s*(\d{10,11})', text)
-            vkn = vkn_match.group(1) if vkn_match else "Bulunamadı"
-
-            # Fatura No & Tarih
-            fatura_no_match = re.search(r'Fatura No\s*([A-Z0-9]+)', text)
-            f_no = fatura_no_match.group(1) if fatura_no_match else "Bulunamadı"
-            
-            fatura_tarihi_match = re.search(r'Fatura Tarihi\s*([\d/.-]+)', text)
-            f_tarih = fatura_tarihi_match.group(1) if fatura_tarihi_match else "Bulunamadı"
-
-            # Kilo
-            net_kilo_match = re.search(r'Net Ağırlık\s*:\s*([\d,.]+)\s*KG', text, re.IGNORECASE)
-            brut_kilo_match = re.search(r'Brüt Ağırlık\s*:\s*([\d,.]+)\s*KG', text, re.IGNORECASE)
-            b_kilo = brut_kilo_match.group(1) if brut_kilo_match else "-"
-            n_kilo = net_kilo_match.group(1) if net_kilo_match else "-"
-            kilo_bilgisi = f"Brüt: {b_kilo} KG / Net: {n_kilo} KG"
-
-            # Masrafları Arama (Navlun, Sigorta)
-            navlun_match = re.search(r'NAVLUN[^\d]*?([\d.,]+)\s*([€₺$]|EUR|USD|TL|TRY)?', text, re.IGNORECASE)
-            navlun_val = f"{navlun_match.group(1)} {navlun_match.group(2) or ''}".strip() if navlun_match else None
-
-            sigorta_match = re.search(r'S[İI]GORTA[^\d]*?([\d.,]+)\s*([€₺$]|EUR|USD|TL|TRY)?', text, re.IGNORECASE)
-            sigorta_val = f"{sigorta_match.group(1)} {sigorta_match.group(2) or ''}".strip() if sigorta_match else None
-
-
-            # --- 2. TABLO İŞLEMLERİ VE HESAPLAMALAR ---
-            df_grouped = pd.DataFrame()
-            toplam_adet = 0.0
-            toplam_fiyat = 0.0
-            doviz_cinsi = "EUR" # Varsayılan
-            
-            if all_tables:
-                df = pd.DataFrame(all_tables)
-                baslik_sira = -1
-                for i, row in df.iterrows():
-                    row_str = " ".join([str(x) for x in row.values if x])
-                    if "GTİP" in row_str or "Miktar" in row_str:
-                        baslik_sira = i
-                        break
+            for file in uploaded_files:
+                text = ""
+                file_tables = []
                 
-                if baslik_sira != -1:
-                    df.columns = df.iloc[baslik_sira].astype(str).str.replace('\n', ' ').str.strip()
-                    df = df.iloc[baslik_sira+1:].reset_index(drop=True)
-                    df = df.dropna(how='all')
-
-                    parsed_data = []
-                    for _, row in df.iterrows():
-                        # GTİP okuma ve Notaları temizleme (Örn: 8413.91.00.00.19 -> 841391000019)
-                        gtip = str(row.get('GTİP', '')).replace('.', '').strip()
-                        mensei = str(row.get('Menşe Ülke', '')).replace('\n', ' ').strip()
-                        miktar_str = str(row.get('Miktar', '')).strip()
-                        tutar_str = str(row.get('Mal Hizmet Tutarı', '')).strip()
-                        
-                        mal_tanimi = str(row.get('Mal Hizmet', row.get('Cinsi', row.get('Ürün Kodu', '')))).replace('\n', ' ').strip()
-                        if not mal_tanimi or mal_tanimi.lower() in ["nan", "none"]:
-                            for col in df.columns:
-                                if "mal" in str(col).lower() or "hizmet" in str(col).lower() or "tanım" in str(col).lower() or "cins" in str(col).lower():
-                                    if "tutar" not in str(col).lower() and "fiyat" not in str(col).lower():
-                                        mal_tanimi = str(row.get(col, '')).replace('\n', ' ').strip()
-                                        break
-                                        
-                        if not mal_tanimi or mal_tanimi.lower() in ["nan", "none"]:
-                            mal_tanimi = "Tanım Bulunamadı"
-
-                        if not gtip or gtip.lower() in ["none", "nan", ""] or "toplam" in gtip.lower():
-                            continue
-
-                        # Miktar
-                        miktar_match = re.search(r'([\d,.]+)\s*(.*)', miktar_str)
-                        if miktar_match:
-                            miktar_val = float(miktar_match.group(1).replace('.', '').replace(',', '.'))
-                            birim_val = miktar_match.group(2).strip() or "Adet"
-                        else:
-                            miktar_val = 1.0
-                            birim_val = "Adet"
-
-                        # Tutar ve Döviz
-                        tutar_match = re.search(r'([\d,.]+)', tutar_str)
-                        if tutar_match:
-                            tutar_val = float(tutar_match.group(1).replace('.', '').replace(',', '.'))
-                        else:
-                            tutar_val = 0.0
+                # Dosya Türüne Göre Okuma
+                if file.name.lower().endswith('.pdf'):
+                    with pdfplumber.open(file) as pdf:
+                        for page in pdf.pages:
+                            page_text = page.extract_text()
+                            if page_text:
+                                text += page_text + "\n"
                             
-                        # Döviz bulma (ilk satırdan EUR, USD vb. çeker)
-                        doviz_match = re.search(r'([A-Za-z$€₺]{1,3})', tutar_str.replace(tutar_match.group(1) if tutar_match else '', ''))
-                        if doviz_match:
-                            doviz_cinsi = doviz_match.group(1).strip()
+                            tables = page.extract_tables()
+                            for t in tables:
+                                file_tables.extend(t)
+                            
+                            # Eğer PDF taranmış bir resimse (metin yoksa) OCR ile oku
+                            if not page_text or len(page_text.strip()) < 50:
+                                img = page.to_image(resolution=200).original
+                                text += pytesseract.image_to_string(img, lang='tur+eng') + "\n"
+                else:
+                    # Görüntü Dosyası (JPG, PNG)
+                    img = Image.open(file)
+                    text += pytesseract.image_to_string(img, lang='tur+eng')
+
+                # --- 1. GENEL BİLGİLERİ BULMA (GELİŞTİRİLMİŞ REGEX) ---
+                lines = [line.strip() for line in text.split('\n') if line.strip()]
+                
+                # Ünvan
+                unvan_adaylari = [line for line in lines[:15] if "ŞİRKETİ" in line.upper() or "A.Ş" in line.upper() or "LTD" in line.upper() or "TİC" in line.upper()]
+                if unvan_adaylari: genel_unvanlar.add(unvan_adaylari[0])
+
+                # VKN (Tüm 10-11 haneli numaraları alıp benzersizleri tutuyoruz)
+                vkns = re.findall(r'\b\d{10,11}\b', text)
+                for v in vkns:
+                    if not v.startswith("0000"): genel_vknler.add(v)
+
+                # Fatura No (3 Harf + 202... formatındaki 16 haneli e-arşiv no)
+                f_no_match = re.findall(r'\b[A-Za-z]{3}202\d{9}\b', text)
+                if f_no_match:
+                    for f in f_no_match: genel_fatura_nolar.add(f)
+                else:
+                    f_alt = re.search(r'(?:Fatura No|Belge No)\s*[:\-]?\s*([A-Za-z0-9]+)', text, re.IGNORECASE)
+                    if f_alt: genel_fatura_nolar.add(f_alt.group(1))
+
+                # Tarih
+                tarih_match = re.search(r'(0[1-9]|[12][0-9]|3[01])[-/.](0[1-9]|1[012])[-/.](20\d\d)', text)
+                if tarih_match: genel_tarihler.add(tarih_match.group(0))
+
+                # Kilo ve Masraflar
+                b_kilo = re.search(r'Brüt[^0-9]*([\d,.]+)\s*KG', text, re.IGNORECASE)
+                n_kilo = re.search(r'Net[^0-9]*([\d,.]+)\s*KG', text, re.IGNORECASE)
+                if b_kilo or n_kilo:
+                    kilo_notlari.append(f"Brüt: {b_kilo.group(1) if b_kilo else '-'} / Net: {n_kilo.group(1) if n_kilo else '-'}")
+
+                navlun_m = re.search(r'NAVLUN[^\d]*?([\d.,]+)', text, re.IGNORECASE)
+                if navlun_m: toplam_navlun += float(navlun_m.group(1).replace('.', '').replace(',', '.'))
+                
+                sigorta_m = re.search(r'S[İI]GORTA[^\d]*?([\d.,]+)', text, re.IGNORECASE)
+                if sigorta_m: toplam_sigorta += float(sigorta_m.group(1).replace('.', '').replace(',', '.'))
+
+                # --- 2. AKILLI TABLO / KALEM OKUMA SİSTEMİ ---
+                dosya_kalemleri = []
+                
+                # A) Pandas ile Tablo Okuma Denemesi
+                if file_tables:
+                    df = pd.DataFrame(file_tables)
+                    baslik_sira = -1
+                    for i, row in df.iterrows():
+                        row_str = " ".join([str(x) for x in row.values if x]).upper()
+                        if "GTİP" in row_str or "HS CODE" in row_str or "MİKTAR" in row_str:
+                            baslik_sira = i; break
+                    
+                    if baslik_sira != -1:
+                        df.columns = df.iloc[baslik_sira].astype(str).str.replace('\n', ' ').str.strip().str.upper()
+                        df = df.iloc[baslik_sira+1:].dropna(how='all')
                         
-                        parsed_data.append({
-                            'GTİP': gtip,
-                            'Menşei': mensei,
-                            'Birim': birim_val,
-                            'Mal Tanımı': mal_tanimi,
-                            'Toplam Miktar': miktar_val,
-                            'Toplam Fiyat': tutar_val
-                        })
-
-                    if parsed_data:
-                        df_parsed = pd.DataFrame(parsed_data)
-                        df_grouped = df_parsed.groupby(['GTİP', 'Menşei', 'Birim'], as_index=False).agg({
-                            'Toplam Miktar': 'sum', 
-                            'Toplam Fiyat': 'sum',
-                            'Mal Tanımı': lambda x: ' | '.join(pd.unique(x)) 
-                        })
+                        gtip_col = next((c for c in df.columns if 'GTIP' in c or 'GTİP' in c or 'HS CODE' in c), None)
+                        miktar_col = next((c for c in df.columns if 'MİKTAR' in c or 'MIKTAR' in c or 'QTY' in c), None)
+                        mal_col = next((c for c in df.columns if 'MAL' in c or 'HİZMET' in c or 'CİNS' in c or 'TANIM' in c or 'NAME' in c or 'PART' in c), None)
+                        tutar_col = next((c for c in df.columns if 'TUTAR' in c or 'AMOUNT' in c or 'TOPLAM' in c), None)
+                        mensei_col = next((c for c in df.columns if 'MENŞE' in c or 'ORIGIN' in c), None) # Menşei yoksa None döner
                         
-                        toplam_adet = df_grouped['Toplam Miktar'].sum()
-                        toplam_fiyat = df_grouped['Toplam Fiyat'].sum()
+                        if gtip_col and miktar_col:
+                            for _, row in df.iterrows():
+                                gtip = str(row.get(gtip_col, '')).replace('.', '').strip()
+                                miktar_str = str(row.get(miktar_col, '')).strip()
+                                if not gtip or len(gtip) < 8: continue
+                                
+                                mik_match = re.search(r'([\d,.]+)\s*(.*)', miktar_str)
+                                miktar_val = float(mik_match.group(1).replace('.', '').replace(',', '.')) if mik_match else 1.0
+                                birim_val = mik_match.group(2).strip().title() if mik_match and mik_match.group(2) else "Adet"
+                                
+                                mal_tanimi = str(row.get(mal_col, 'Tanım Bulunamadı')).replace('\n', ' ') if mal_col else "Tanım Bulunamadı"
+                                mensei = str(row.get(mensei_col, 'Belirtilmemiş')).replace('\n', ' ') if mensei_col else 'Belirtilmemiş'
+                                
+                                tutar_str = str(row.get(tutar_col, '0')).strip() if tutar_col else "0"
+                                tutar_match = re.search(r'([\d,.]+)', tutar_str)
+                                tutar_val = float(tutar_match.group(1).replace('.', '').replace(',', '.')) if tutar_match else 0.0
+                                
+                                dosya_kalemleri.append({'GTİP': gtip, 'Menşei': mensei, 'Birim': birim_val, 'Mal Tanımı': mal_tanimi, 'Miktar': miktar_val, 'Fiyat': tutar_val})
 
+                # B) Tablo Bozuksa Yapay Zeka Regex Metin Tarama (Kurtarıcı Sistem)
+                if not dosya_kalemleri:
+                    for line in text.split('\n'):
+                        gtip_m = re.search(r'\b(\d{10,12})\b', line) # 10-12 Haneli GTİP arar
+                        miktar_m = re.search(r'\b(\d+[.,]?\d*)\s*(Adet|Kutu|Paket|Set|Kg|Pcs|Ad|M2|Çift|Roll|Metre)\b', line, re.IGNORECASE)
+                        
+                        if gtip_m and miktar_m:
+                            gtip = gtip_m.group(1)
+                            miktar = float(miktar_m.group(1).replace('.', '').replace(',', '.'))
+                            birim = miktar_m.group(2).title()
+                            
+                            prices = re.findall(r'\b(\d{1,3}(?:\.\d{3})*(?:,\d{2}))\b', line)
+                            tutar = float(prices[-1].replace('.', '').replace(',', '.')) if prices else 0.0
+                            
+                            desc_part = line[:miktar_m.start()].strip()
+                            desc_part = re.sub(r'^\d+\s*[\-\.]?\s*', '', desc_part) # Sıra numarasını siler
+                            mal_tanimi = desc_part if len(desc_part) > 3 else "Tanım Bulunamadı"
+                            
+                            dosya_kalemleri.append({'GTİP': gtip, 'Menşei': 'Belirtilmemiş', 'Birim': birim, 'Mal Tanımı': mal_tanimi, 'Miktar': miktar, 'Fiyat': tutar})
+                
+                tum_kalemler.extend(dosya_kalemleri)
 
-            # --- 3. EKRAN TASARIMI (SOL VE SAĞ SÜTUN) ---
-            st.success("Belge başarıyla okundu!")
-            col_sol, col_sag = st.columns([1.2, 2.5]) # Sol taraf özet (dar), sağ taraf liste (geniş)
+            # --- 3. EKRAN TASARIMI VE GRUPLAMA ---
+            st.success(f"{len(uploaded_files)} Adet Belge Başarıyla Okundu ve Birleştirildi!")
+            col_sol, col_sag = st.columns([1.2, 2.5])
 
-            # --- SOL TARAF: ÖZET TABLO ---
+            if tum_kalemler:
+                df_parsed = pd.DataFrame(tum_kalemler)
+                df_grouped = df_parsed.groupby(['GTİP', 'Menşei', 'Birim'], as_index=False).agg({
+                    'Miktar': 'sum', 'Fiyat': 'sum', 'Mal Tanımı': lambda x: ' | '.join(pd.unique(x))
+                })
+                toplam_adet = df_grouped['Miktar'].sum()
+                toplam_fiyat = df_grouped['Fiyat'].sum()
+            else:
+                df_grouped = pd.DataFrame()
+                toplam_adet = 0
+                toplam_fiyat = 0.0
+
+            # SOL TARAF: ÖZET TABLO (Kalın Metinler)
             with col_sol:
                 st.markdown("### 📋 ÖZET TABLO")
                 
-                # Firma bilgileri ve toplamlar tamamen KALIN yazıldı
-                ozet_metin = f"""
-                **🏢 GÖNDEREN ÜNVANI:**  
-                **{unvan}**  
-                
-                **🏷️ VERGİ NUMARASI:** **{vkn}**  
-                
-                **📄 E-ARŞİV FATURA NO:** **{f_no}**  
-                
-                **📅 FATURA TARİHİ:** **{f_tarih}**  
-                
-                **⚖️ AĞIRLIK BİLGİSİ:** **{kilo_bilgisi}**  
-                
-                ---
-                **📦 TOPLAM ADET / MİKTAR:** **{int(toplam_adet) if toplam_adet.is_integer() else toplam_adet}**  
-                
-                **💰 MASRAFLAR HARİÇ TOPLAM:** **{toplam_fiyat:,.2f} {doviz_cinsi}**  
-                """
-                st.markdown(ozet_metin)
+                g_unvan = "<br>".join(genel_unvanlar) if genel_unvanlar else "Bulunamadı"
+                g_vkn = ", ".join(genel_vknler) if genel_vknler else "Bulunamadı"
+                g_fatura = "<br>".join(genel_fatura_nolar) if genel_fatura_nolar else "Bulunamadı"
+                g_tarih = ", ".join(genel_tarihler) if genel_tarihler else "Bulunamadı"
+                g_kilo = "<br>".join(kilo_notlari) if kilo_notlari else "Belirtilmemiş"
+
+                st.markdown(f"""
+                <div style='font-weight: bold; font-size: 15px; line-height: 1.6;'>
+                🏢 GÖNDEREN ÜNVANI:<br><span style='font-size: 16px; color:#2e7bcf;'>{g_unvan}</span><br><br>
+                🏷️ VERGİ NUMARASI:<br><span style='font-size: 16px;'>{g_vkn}</span><br><br>
+                📄 E-ARŞİV FATURA NO:<br><span style='font-size: 16px;'>{g_fatura}</span><br><br>
+                📅 FATURA TARİHİ:<br><span style='font-size: 16px;'>{g_tarih}</span><br><br>
+                ⚖️ AĞIRLIK BİLGİSİ:<br><span style='font-size: 16px;'>{g_kilo}</span><br>
+                <hr>
+                📦 TOPLAM ADET / MİKTAR: <span style='font-size: 18px;'>{int(toplam_adet) if toplam_adet == int(toplam_adet) else toplam_adet}</span><br><br>
+                💰 MASRAFLAR HARİÇ TOPLAM: <span style='font-size: 18px;'>{toplam_fiyat:,.2f} {doviz_cinsi}</span>
+                </div>
+                """, unsafe_allow_html=True)
 
                 st.markdown("---")
                 st.markdown("### 💸 MASRAFLAR")
-                # Masraflar Kırmızı ve Kalın Yazdırılır
-                if navlun_val:
-                    st.markdown(f"<div style='color:red; font-size:18px; font-weight:bold;'>🚢 NAVLUN: {navlun_val}</div>", unsafe_allow_html=True)
-                if sigorta_val:
-                    st.markdown(f"<div style='color:red; font-size:18px; font-weight:bold;'>🛡️ SİGORTA: {sigorta_val}</div>", unsafe_allow_html=True)
-                    
-                if not navlun_val and not sigorta_val:
+                if toplam_navlun > 0 or toplam_sigorta > 0:
+                    if toplam_navlun > 0:
+                        st.markdown(f"<div style='color:red; font-size:18px; font-weight:bold;'>🚢 NAVLUN: {toplam_navlun:,.2f} {doviz_cinsi}</div>", unsafe_allow_html=True)
+                    if toplam_sigorta > 0:
+                        st.markdown(f"<div style='color:red; font-size:18px; font-weight:bold;'>🛡️ SİGORTA: {toplam_sigorta:,.2f} {doviz_cinsi}</div>", unsafe_allow_html=True)
+                else:
                     st.markdown("<div style='color:red; font-size:16px; font-weight:bold;'>Faturada Belirtilmemiş</div>", unsafe_allow_html=True)
 
-
-            # --- SAĞ TARAF: POP-UP (AÇILIR KAPANIR) LİSTE ---
+            # SAĞ TARAF: KALEMLER (Pop-Up)
             with col_sag:
                 st.markdown("### 📋 GRUPLANMIŞ BEYAN KALEMLERİ")
                 
                 if not df_grouped.empty:
                     for index, row in df_grouped.iterrows():
                         tam_tanim = row['Mal Tanımı']
-                        kisa_tanim = tam_tanim[:40] + "..." if len(tam_tanim) > 40 else tam_tanim
+                        kisa_tanim = tam_tanim[:45] + "..." if len(tam_tanim) > 45 else tam_tanim
                         
-                        baslik_metni = f"📦 KALEM {index + 1}  |  GTİP: {row['GTİP']}  |  {kisa_tanim}"
+                        # Noktaları kaldırılmış temiz GTİP
+                        temiz_gtip = str(row['GTİP']).replace('.', '')
+                        
+                        baslik_metni = f"📦 KALEM {index + 1}  |  GTİP: {temiz_gtip}  |  {kisa_tanim}"
                         
                         with st.expander(baslik_metni, expanded=False):
-                            # GTİP ve Mal Tanımı HTML tagleri ile BÜYÜK ve KALIN yapıldı
-                            st.markdown(f"<div style='font-size: 1.25em; font-weight: bold; margin-bottom: 5px;'>🔹 GTİP Kodu: {row['GTİP']}</div>", unsafe_allow_html=True)
-                            st.markdown(f"<div style='font-size: 1.15em; font-weight: bold; margin-bottom: 15px;'>🏷️ Tam Mal Tanımı: {tam_tanim}</div>", unsafe_allow_html=True)
+                            st.markdown(f"<div style='font-size: 1.35em; font-weight: bold; margin-bottom: 5px;'>🔹 GTİP Kodu: {temiz_gtip}</div>", unsafe_allow_html=True)
+                            st.markdown(f"<div style='font-size: 1.25em; font-weight: bold; margin-bottom: 15px;'>🏷️ Tam Mal Tanımı: {tam_tanim}</div>", unsafe_allow_html=True)
                             
                             st.markdown(f"**🌍 Menşei:** {row['Menşei']}")
-                            miktar_gosterim = int(row['Toplam Miktar']) if row['Toplam Miktar'].is_integer() else row['Toplam Miktar']
+                            miktar_gosterim = int(row['Miktar']) if row['Miktar'] == int(row['Miktar']) else row['Miktar']
                             st.markdown(f"**⚖️ Toplam Miktar:** {miktar_gosterim} {row['Birim']}")
-                            st.markdown(f"**💰 Toplam Fiyat:** {row['Toplam Fiyat']:,.2f} {doviz_cinsi}".replace(',', 'X').replace('.', ',').replace('X', '.'))
+                            st.markdown(f"**💰 Toplam Fiyat:** {row['Fiyat']:,.2f} {doviz_cinsi}".replace(',', 'X').replace('.', ',').replace('X', '.'))
 
                     st.markdown("---")
-                    
-                    # CSV İndirme Butonu
-                    df_indirme = df_grouped.copy()
-                    df_indirme['Brüt/Net Kilo'] = kilo_bilgisi
-                    csv = df_indirme.to_csv(index=False).encode('utf-8-sig')
-                    st.download_button(
-                        label="📥 Tabloyu Excel (CSV) Olarak İndir", 
-                        data=csv, 
-                        file_name='etgb_kalemler.csv', 
-                        mime='text/csv'
-                    )
+                    csv = df_grouped.to_csv(index=False).encode('utf-8-sig')
+                    st.download_button("📥 Tüm Tabloyu Excel (CSV) Olarak İndir", data=csv, file_name='etgb_toplu_kalemler.csv', mime='text/csv')
                 else:
-                    st.warning("Fatura kalemleri tablodan çıkarılamadı.")
+                    st.warning("Bu belgelerden fatura kalemi çıkarılamadı.")
 
         except Exception as e:
-            st.error(f"Dosya işlenirken hata oluştu: {e}")
+            st.error(f"Dosyalar işlenirken bir hata oluştu: {e}")
